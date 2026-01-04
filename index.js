@@ -28,7 +28,7 @@
  *   APP_NAME                          - App name for logging (default: Running Order)
  *   GITHUB_REPO_OWNER                 - GitHub org/user (default: desai-deep)
  *   GITHUB_REPO_NAME                  - GitHub repo name (default: runningorder-ios)
- *   XCODE_WORKFLOW_NAME               - Xcode Cloud workflow to process (default: Publish to App Store)
+ *   XCODE_WORKFLOW_ID                 - Xcode Cloud workflow ID to filter builds
  */
 
 // Suppress dotenv logging

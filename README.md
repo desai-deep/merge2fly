@@ -105,7 +105,7 @@ npm run sync:dry       # Dry run sync
 | `APP_NAME` | `Running Order` | App name (for logging) |
 | `GITHUB_REPO_OWNER` | `desai-deep` | GitHub org/user |
 | `GITHUB_REPO_NAME` | `runningorder-ios` | GitHub repo name |
-| `XCODE_WORKFLOW_NAME` | `Publish to App Store` | Xcode Cloud workflow to monitor |
+| `XCODE_WORKFLOW_ID` | - | Xcode Cloud workflow ID to filter builds |
 | `DRY_RUN` | `false` | Run without making changes |
 
 ## Requirements
