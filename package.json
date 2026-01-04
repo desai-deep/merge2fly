@@ -1,0 +1,27 @@
+{
+  "name": "merge2fly",
+  "version": "1.0.0",
+  "description": "Automated iOS App Store deployment - monitors TestFlight and submits to App Store review",
+  "main": "ios-deploy.js",
+  "type": "module",
+  "scripts": {
+    "start": "node ios-deploy.js",
+    "dry-run": "DRY_RUN=true node ios-deploy.js"
+  },
+  "keywords": [
+    "ios",
+    "app-store",
+    "testflight",
+    "xcode-cloud",
+    "deployment",
+    "automation"
+  ],
+  "author": "Deep Desai",
+  "license": "MIT",
+  "dependencies": {
+    "dotenv": "^17.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
