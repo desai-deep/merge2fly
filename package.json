@@ -2,14 +2,15 @@
   "name": "merge2fly",
   "version": "1.0.0",
   "description": "Automated iOS App Store deployment and release sync",
-  "main": "ios-deploy.js",
+  "main": "index.js",
   "type": "module",
   "scripts": {
-    "deploy": "node ios-deploy.js",
-    "deploy:dry": "DRY_RUN=true node ios-deploy.js",
-    "sync": "node ios-release-sync.js",
-    "sync:dry": "DRY_RUN=true node ios-release-sync.js",
-    "start": "npm run deploy && npm run sync"
+    "start": "node index.js",
+    "start:dry": "DRY_RUN=true node index.js",
+    "deploy": "node index.js deploy",
+    "deploy:dry": "DRY_RUN=true node index.js deploy",
+    "sync": "node index.js sync",
+    "sync:dry": "DRY_RUN=true node index.js sync"
   },
   "keywords": [
     "ios",

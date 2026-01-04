@@ -1,19 +1,23 @@
 #!/usr/bin/env node
 
 /**
- * iOS Deployment Script
+ * merge2fly - iOS App Store Deployment & Release Sync
  *
- * Standalone Node.js script that monitors TestFlight builds and submits them
- * to App Store review. Replaces Fastlane dependency with direct App Store Connect API calls.
+ * Combined script that:
+ * 1. Monitors TestFlight builds and submits them to App Store review (deploy)
+ * 2. Tags releases when they go live in the App Store (release sync)
  *
  * Usage:
- *   node ios-deploy.js              # Normal mode
- *   DRY_RUN=true node ios-deploy.js # Dry run mode
+ *   node index.js                    # Run both operations
+ *   node index.js deploy             # Run only deployment check
+ *   node index.js sync               # Run only release sync
+ *   DRY_RUN=true node index.js       # Dry run mode
  *
  * Required environment variables:
  *   APP_STORE_CONNECT_API_KEY_ID      - App Store Connect API Key ID
  *   APP_STORE_CONNECT_ISSUER_ID       - App Store Connect Issuer ID
  *   APP_STORE_CONNECT_API_KEY_CONTENT - API private key (base64 encoded)
+ *   IOS_REPO_PATH                     - Path to iOS git repository (for tagging)
  *
  * Optional environment variables:
  *   GH_TOKEN / GITHUB_TOKEN           - GitHub token for PR comments (used by gh CLI)
@@ -44,7 +48,7 @@ const __dirname = path.dirname(__filename);
 dotenv.config({ path: path.join(__dirname, '.env') });
 
 // Lock file to prevent concurrent runs
-const LOCK_FILE = path.join(__dirname, '.ios-deploy.lock');
+const LOCK_FILE = path.join(__dirname, '.merge2fly.lock');
 const LOCK_MAX_AGE_MS = 30 * 60 * 1000; // 30 minutes
 
 // Configuration - all values can be overridden via environment variables
@@ -57,6 +61,9 @@ const CONFIG = {
   iosRepoOwner: process.env.GITHUB_REPO_OWNER || 'desai-deep',
   iosRepoName: process.env.GITHUB_REPO_NAME || 'runningorder-ios',
 
+  // iOS repo path for git operations
+  iosRepoPath: process.env.IOS_REPO_PATH || '',
+
   // Xcode Cloud workflow name to filter builds
   workflowName: process.env.XCODE_WORKFLOW_NAME || 'Publish to App Store',
 
@@ -65,7 +72,7 @@ const CONFIG = {
 };
 
 // Logging
-const LOG_FILE = path.join(__dirname, 'logs', 'ios-deploy.log');
+const LOG_FILE = path.join(__dirname, 'logs', 'merge2fly.log');
 
 function log(message) {
   const timestamp = new Date().toISOString().replace('T', ' ').substring(0, 19);
@@ -79,7 +86,10 @@ function log(message) {
   }
 }
 
+// ============================================================================
 // App Store Connect API Client
+// ============================================================================
+
 class AppStoreConnectAPI {
   constructor(keyId, issuerId, privateKeyContent) {
     this.keyId = keyId;
@@ -567,7 +577,10 @@ class AppStoreConnectAPI {
   }
 }
 
-// GitHub integration
+// ============================================================================
+// GitHub Integration
+// ============================================================================
+
 class GitHubAPI {
   constructor(repoOwner, repoName) {
     this.repoOwner = repoOwner;
@@ -651,7 +664,85 @@ class GitHubAPI {
   }
 }
 
-// Lock management
+// ============================================================================
+// Git Operations (for release sync)
+// ============================================================================
+
+class GitOperations {
+  constructor(repoPath) {
+    this.repoPath = repoPath;
+  }
+
+  exec(command) {
+    return execSync(command, {
+      cwd: this.repoPath,
+      encoding: 'utf8',
+      timeout: 60000,
+    }).trim();
+  }
+
+  // Fetch latest from origin
+  fetch() {
+    this.exec('git fetch origin main develop --tags');
+  }
+
+  // Check if tag exists
+  tagExists(tagName) {
+    try {
+      this.exec(`git rev-parse ${tagName}`);
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // Check if commit exists
+  commitExists(commitSha) {
+    try {
+      this.exec(`git cat-file -e ${commitSha}`);
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // Resolve reference to commit SHA
+  resolveRef(ref) {
+    try {
+      return this.exec(`git rev-parse ${ref}`);
+    } catch (e) {
+      try {
+        return this.exec(`git rev-parse origin/${ref}`);
+      } catch (e2) {
+        return null;
+      }
+    }
+  }
+
+  // Get commit message
+  getCommitMessage(commitSha) {
+    try {
+      return this.exec(`git log -1 --pretty=%s ${commitSha}`);
+    } catch (e) {
+      return '';
+    }
+  }
+
+  // Create annotated tag
+  createTag(tagName, commitSha, message) {
+    this.exec(`git tag -a "${tagName}" ${commitSha} -m "${message.replace(/"/g, '\\"')}"`);
+  }
+
+  // Push tag to origin
+  pushTag(tagName) {
+    this.exec(`git push origin ${tagName}`);
+  }
+}
+
+// ============================================================================
+// Lock Management
+// ============================================================================
+
 function acquireLock() {
   try {
     // Check if lock exists and is stale
@@ -685,9 +776,309 @@ function releaseLock() {
   }
 }
 
-// Main deployment logic
+// ============================================================================
+// Deploy Check - Submit builds for App Store review
+// ============================================================================
+
+async function runDeployCheck(asc, github, DRY_RUN) {
+  log('--- Deploy Check ---');
+
+  // Step 1: Check if a build is already in review
+  log('Checking if a build is already in review...');
+  const reviewStatus = await asc.checkBuildInReview();
+
+  if (reviewStatus.inReview) {
+    log(`Build #${reviewStatus.buildNumber} (v${reviewStatus.version}) is currently ${reviewStatus.state}`);
+  }
+
+  // Step 2: Get latest TestFlight build ready for submission
+  log('Checking for latest TestFlight build...');
+  const latestBuild = await asc.getLatestTestFlightReadyBuild();
+
+  if (!latestBuild.found) {
+    log('No TestFlight builds ready for App Store submission');
+    return;
+  }
+
+  log(`Latest TestFlight build: #${latestBuild.buildNumber} (v${latestBuild.version})`);
+
+  // Step 3: Check if this build is already live
+  log('Checking if build is already live...');
+  const liveStatus = await asc.getLiveProductionBuild();
+
+  if (liveStatus.live && liveStatus.buildNumber === latestBuild.buildNumber) {
+    log(`Build ${latestBuild.buildNumber} is already live in production`);
+    return;
+  }
+
+  // Step 4: Get commit SHA for this build from Xcode Cloud
+  log(`Getting commit SHA for build #${latestBuild.buildNumber}...`);
+  const commitInfo = await asc.getBuildCommitSHA(latestBuild.buildNumber);
+
+  if (!commitInfo.found || !commitInfo.commitSha) {
+    log(`No commit SHA found for build #${latestBuild.buildNumber}`);
+    return;
+  }
+
+  // Step 5: Check which workflow built this
+  if (commitInfo.workflowName !== CONFIG.workflowName) {
+    log(`Build #${latestBuild.buildNumber} is from '${commitInfo.workflowName}' workflow, not '${CONFIG.workflowName}' - skipping`);
+    return;
+  }
+
+  log(`Build #${latestBuild.buildNumber} is from '${CONFIG.workflowName}' workflow`);
+  log(`Build #${latestBuild.buildNumber} is from commit: ${commitInfo.commitSha.substring(0, 7)}`);
+
+  // Step 6: Find the PR that introduced this commit
+  const prNumber = github.findPRFromCommit(commitInfo.commitSha);
+  let releaseNotes = 'Bug fixes and improvements';
+
+  if (prNumber) {
+    log(`Found PR #${prNumber} for this build`);
+
+    const prDetails = github.getPRDetails(prNumber);
+    if (prDetails) {
+      releaseNotes = github.extractReleaseNotes(prDetails.body, prDetails.title);
+      log(`Release notes from PR #${prNumber}: ${releaseNotes}`);
+    }
+
+    // Step 7: Handle existing review
+    if (reviewStatus.inReview) {
+      const reviewBuildNum = parseInt(reviewStatus.buildNumber, 10);
+      const latestBuildNum = parseInt(latestBuild.buildNumber, 10);
+
+      if (isNaN(reviewBuildNum) || isNaN(latestBuildNum)) {
+        log('Non-numeric build number detected, skipping to avoid conflicts');
+        return;
+      }
+
+      if (latestBuildNum <= reviewBuildNum) {
+        if (latestBuildNum === reviewBuildNum) {
+          log(`Build #${reviewStatus.buildNumber} is already in review - no newer build available`);
+        } else {
+          log(`Warning: Build #${reviewStatus.buildNumber} in review is newer than latest main branch build #${latestBuild.buildNumber}`);
+        }
+        return;
+      }
+
+      // Newer build available - cancel current review
+      log(`Newer build #${latestBuild.buildNumber} from PR #${prNumber} available (current in review: #${reviewStatus.buildNumber})`);
+
+      if (DRY_RUN) {
+        log(`[DRY RUN] Would cancel review for build #${reviewStatus.buildNumber} (v${reviewStatus.version})`);
+        log(`[DRY RUN] Would look up cancelled build's PR to notify`);
+      } else {
+        log('Cancelling current review to submit newer build...');
+        const cancelResult = await asc.cancelReview(reviewStatus.versionId);
+
+        if (cancelResult.success) {
+          log(`Successfully cancelled review for build #${reviewStatus.buildNumber}`);
+
+          // Try to find and comment on the cancelled build's PR
+          try {
+            const cancelledCommitInfo = await asc.getBuildCommitSHA(reviewStatus.buildNumber);
+            if (cancelledCommitInfo.found && cancelledCommitInfo.commitSha) {
+              const cancelledPrNumber = github.findPRFromCommit(cancelledCommitInfo.commitSha);
+              if (cancelledPrNumber && cancelledPrNumber !== prNumber) {
+                const cancelComment = `Build #${reviewStatus.buildNumber} has been withdrawn from App Store review.\n\nA newer build #${latestBuild.buildNumber} from PR #${prNumber} has been submitted instead.`;
+                if (github.addPRComment(cancelledPrNumber, cancelComment)) {
+                  log(`Added cancellation notice to PR #${cancelledPrNumber}`);
+                }
+              }
+            }
+          } catch (e) {
+            log(`Warning: Could not notify cancelled build's PR: ${e.message}`);
+          }
+        } else {
+          log(`Failed to cancel review: ${cancelResult.error}`);
+          return;
+        }
+      }
+    }
+  } else {
+    // No PR found
+    if (reviewStatus.inReview) {
+      log(`Build #${latestBuild.buildNumber} is not from a merged PR, skipping (build #${reviewStatus.buildNumber} already in review)`);
+      return;
+    }
+    log('No PR found for commit, using default release notes');
+  }
+
+  // Step 8: Submit build for review
+  if (DRY_RUN) {
+    log(`[DRY RUN] Would submit build #${latestBuild.buildNumber} for review`);
+    log(`[DRY RUN] Release notes: ${releaseNotes}`);
+  } else {
+    log(`Submitting build #${latestBuild.buildNumber} for review...`);
+
+    // Get the build details
+    const buildDetails = await asc.getBuildByNumber(latestBuild.buildNumber);
+    if (!buildDetails) {
+      log(`ERROR: Build #${latestBuild.buildNumber} not found`);
+      return;
+    }
+
+    // Get or create the version
+    const versionInfo = await asc.getOrCreateAppStoreVersion(buildDetails.version);
+    log(`Version ${buildDetails.version}: ${versionInfo.exists ? 'exists' : 'created'} (state: ${versionInfo.state})`);
+
+    // Check if we can submit
+    const submittableStates = ['PREPARE_FOR_SUBMISSION', 'DEVELOPER_REJECTED', 'REJECTED'];
+    if (!submittableStates.includes(versionInfo.state)) {
+      if (versionInfo.state === 'WAITING_FOR_REVIEW' || versionInfo.state === 'IN_REVIEW') {
+        log(`Version ${buildDetails.version} is already in ${versionInfo.state} state`);
+        return;
+      }
+      log(`ERROR: Cannot submit version in state: ${versionInfo.state}`);
+      return;
+    }
+
+    // Select the build
+    log(`Selecting build ${latestBuild.buildNumber}...`);
+    await asc.selectBuildForVersion(versionInfo.versionId, buildDetails.buildId);
+
+    // Update release notes
+    log('Updating release notes...');
+    await asc.updateReleaseNotes(versionInfo.versionId, releaseNotes);
+
+    // Submit for review
+    log('Submitting for review...');
+    await asc.submitForReview(versionInfo.versionId);
+
+    log(`Successfully submitted build #${latestBuild.buildNumber} for App Store review!`);
+    log(`Release notes: ${releaseNotes}`);
+
+    // Add comment to PR
+    if (prNumber) {
+      const comment = `Build #${latestBuild.buildNumber} has been submitted to App Store for review.\n\n**Release Notes:**\n${releaseNotes}`;
+      if (github.addPRComment(prNumber, comment)) {
+        log(`Added comment to PR #${prNumber}`);
+      }
+    }
+  }
+
+  log('Deploy check complete');
+}
+
+// ============================================================================
+// Release Sync - Tag builds when they go live
+// ============================================================================
+
+async function runReleaseSync(asc, git, github, DRY_RUN) {
+  log('--- Release Sync ---');
+
+  // Check if IOS_REPO_PATH is configured
+  if (!CONFIG.iosRepoPath) {
+    log('IOS_REPO_PATH not configured - skipping release sync');
+    return;
+  }
+
+  // Step 1: Get live production build
+  log('Checking for live production build...');
+  const liveStatus = await asc.getLiveProductionBuild();
+
+  if (!liveStatus.live || liveStatus.buildNumber === '0') {
+    log('No live production build found (app may not be released yet)');
+    return;
+  }
+
+  log(`Live production build: #${liveStatus.buildNumber} (v${liveStatus.version})`);
+
+  // Validate version format
+  if (!/^\d+\.\d+(\.\d+)?$/.test(liveStatus.version)) {
+    log(`ERROR: Invalid version format: ${liveStatus.version}`);
+    return;
+  }
+
+  // Step 2: Check if tag already exists
+  const tagName = `v${liveStatus.version}-${liveStatus.buildNumber}`;
+  log(`Checking if tag ${tagName} already exists...`);
+
+  git.fetch();
+
+  if (git.tagExists(tagName)) {
+    log(`Tag ${tagName} already exists - build already synced`);
+    return;
+  }
+
+  log(`New production release detected: build #${liveStatus.buildNumber}`);
+
+  // Step 3: Get commit SHA for this build
+  log(`Getting commit SHA for build #${liveStatus.buildNumber}...`);
+  const commitInfo = await asc.getBuildCommitSHA(liveStatus.buildNumber);
+
+  if (!commitInfo.found || !commitInfo.commitSha) {
+    log(`No commit SHA found for build #${liveStatus.buildNumber}`);
+    log('This build may have been submitted before commit tracking was implemented');
+    return;
+  }
+
+  let commitSha = commitInfo.commitSha;
+  log(`Found commit reference: ${commitSha}`);
+
+  // Step 4: Resolve to full commit SHA if needed
+  if (!/^[0-9a-fA-F]{40}$/.test(commitSha)) {
+    log(`Resolving reference ${commitSha} to commit SHA...`);
+    const resolved = git.resolveRef(commitSha);
+
+    if (!resolved) {
+      log(`Could not resolve reference '${commitSha}' to a commit`);
+      return;
+    }
+
+    commitSha = resolved;
+    log(`Resolved to commit SHA: ${commitSha}`);
+  }
+
+  // Step 5: Verify commit exists
+  if (!git.commitExists(commitSha)) {
+    log(`ERROR: Commit ${commitSha} not found in repository`);
+    return;
+  }
+
+  const commitMsg = git.getCommitMessage(commitSha);
+  log(`Commit message: ${commitMsg}`);
+
+  // Step 6: Create and push tag
+  if (DRY_RUN) {
+    log(`[DRY RUN] Would create tag ${tagName} on commit ${commitSha.substring(0, 7)}`);
+    log(`[DRY RUN] Would push tag to origin`);
+  } else {
+    log(`Creating tag ${tagName}...`);
+    git.createTag(tagName, commitSha, `Production release: version ${liveStatus.version}, build ${liveStatus.buildNumber}`);
+
+    log(`Pushing tag ${tagName}...`);
+    git.pushTag(tagName);
+
+    log(`Created and pushed tag ${tagName}`);
+  }
+
+  // Step 7: Comment on the PR
+  const prNumber = github.findPRFromCommit(commitSha);
+
+  if (prNumber) {
+    if (DRY_RUN) {
+      log(`[DRY RUN] Would add release comment to PR #${prNumber}`);
+    } else {
+      const comment = `Build #${liveStatus.buildNumber} has been released to the App Store as version ${liveStatus.version}.`;
+      if (github.addPRComment(prNumber, comment)) {
+        log(`Added release comment to PR #${prNumber}`);
+      }
+    }
+  }
+
+  log(`Successfully synced build #${liveStatus.buildNumber} and tagged as ${tagName}`);
+  log('Release sync complete');
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+
 async function main() {
   const DRY_RUN = process.env.DRY_RUN === 'true';
+  const args = process.argv.slice(2);
+  const mode = args[0] || 'all'; // 'deploy', 'sync', or 'all'
 
   // Acquire lock
   if (!acquireLock()) {
@@ -700,17 +1091,25 @@ async function main() {
   process.on('SIGINT', () => { releaseLock(); process.exit(0); });
   process.on('SIGTERM', () => { releaseLock(); process.exit(0); });
 
-  log('Starting iOS deployment check...');
+  log('=== merge2fly ===');
+  log(`Mode: ${mode}`);
   if (DRY_RUN) {
     log('DRY RUN MODE - No actual changes will be made');
   }
 
-  // Validate environment variables
+  // Validate required environment variables
   const requiredVars = [
     'APP_STORE_CONNECT_API_KEY_ID',
     'APP_STORE_CONNECT_ISSUER_ID',
     'APP_STORE_CONNECT_API_KEY_CONTENT',
   ];
+
+  // IOS_REPO_PATH is only required for sync mode
+  if (mode === 'sync' || mode === 'all') {
+    if (!process.env.IOS_REPO_PATH) {
+      log('Warning: IOS_REPO_PATH not set - release sync will be skipped');
+    }
+  }
 
   for (const varName of requiredVars) {
     if (!process.env[varName]) {
@@ -719,7 +1118,7 @@ async function main() {
     }
   }
 
-  // Initialize API clients
+  // Initialize clients
   const asc = new AppStoreConnectAPI(
     process.env.APP_STORE_CONNECT_API_KEY_ID,
     process.env.APP_STORE_CONNECT_ISSUER_ID,
@@ -727,183 +1126,22 @@ async function main() {
   );
 
   const github = new GitHubAPI(CONFIG.iosRepoOwner, CONFIG.iosRepoName);
+  const git = CONFIG.iosRepoPath ? new GitOperations(CONFIG.iosRepoPath) : null;
 
   try {
-    // Step 1: Check if a build is already in review
-    log('Checking if a build is already in review...');
-    const reviewStatus = await asc.checkBuildInReview();
-
-    if (reviewStatus.inReview) {
-      log(`Build #${reviewStatus.buildNumber} (v${reviewStatus.version}) is currently ${reviewStatus.state}`);
+    // Run deploy check
+    if (mode === 'deploy' || mode === 'all') {
+      await runDeployCheck(asc, github, DRY_RUN);
     }
 
-    // Step 2: Get latest TestFlight build ready for submission
-    log('Checking for latest TestFlight build...');
-    const latestBuild = await asc.getLatestTestFlightReadyBuild();
-
-    if (!latestBuild.found) {
-      log('No TestFlight builds ready for App Store submission');
-      return;
-    }
-
-    log(`Latest TestFlight build: #${latestBuild.buildNumber} (v${latestBuild.version})`);
-
-    // Step 3: Check if this build is already live
-    log('Checking if build is already live...');
-    const liveStatus = await asc.getLiveProductionBuild();
-
-    if (liveStatus.live && liveStatus.buildNumber === latestBuild.buildNumber) {
-      log(`Build ${latestBuild.buildNumber} is already live in production`);
-      return;
-    }
-
-    // Step 4: Get commit SHA for this build from Xcode Cloud
-    log(`Getting commit SHA for build #${latestBuild.buildNumber}...`);
-    const commitInfo = await asc.getBuildCommitSHA(latestBuild.buildNumber);
-
-    if (!commitInfo.found || !commitInfo.commitSha) {
-      log(`No commit SHA found for build #${latestBuild.buildNumber}`);
-      return;
-    }
-
-    // Step 5: Check which workflow built this
-    if (commitInfo.workflowName !== CONFIG.workflowName) {
-      log(`Build #${latestBuild.buildNumber} is from '${commitInfo.workflowName}' workflow, not '${CONFIG.workflowName}' - skipping`);
-      return;
-    }
-
-    log(`Build #${latestBuild.buildNumber} is from '${CONFIG.workflowName}' workflow`);
-    log(`Build #${latestBuild.buildNumber} is from commit: ${commitInfo.commitSha.substring(0, 7)}`);
-
-    // Step 6: Find the PR that introduced this commit
-    const prNumber = github.findPRFromCommit(commitInfo.commitSha);
-    let releaseNotes = 'Bug fixes and improvements';
-
-    if (prNumber) {
-      log(`Found PR #${prNumber} for this build`);
-
-      const prDetails = github.getPRDetails(prNumber);
-      if (prDetails) {
-        releaseNotes = github.extractReleaseNotes(prDetails.body, prDetails.title);
-        log(`Release notes from PR #${prNumber}: ${releaseNotes}`);
-      }
-
-      // Step 7: Handle existing review
-      if (reviewStatus.inReview) {
-        const reviewBuildNum = parseInt(reviewStatus.buildNumber, 10);
-        const latestBuildNum = parseInt(latestBuild.buildNumber, 10);
-
-        if (isNaN(reviewBuildNum) || isNaN(latestBuildNum)) {
-          log('Non-numeric build number detected, skipping to avoid conflicts');
-          return;
-        }
-
-        if (latestBuildNum <= reviewBuildNum) {
-          if (latestBuildNum === reviewBuildNum) {
-            log(`Build #${reviewStatus.buildNumber} is already in review - no newer build available`);
-          } else {
-            log(`Warning: Build #${reviewStatus.buildNumber} in review is newer than latest main branch build #${latestBuild.buildNumber}`);
-          }
-          return;
-        }
-
-        // Newer build available - cancel current review
-        log(`Newer build #${latestBuild.buildNumber} from PR #${prNumber} available (current in review: #${reviewStatus.buildNumber})`);
-
-        if (DRY_RUN) {
-          log(`[DRY RUN] Would cancel review for build #${reviewStatus.buildNumber} (v${reviewStatus.version})`);
-          log(`[DRY RUN] Would look up cancelled build's PR to notify`);
-        } else {
-          log('Cancelling current review to submit newer build...');
-          const cancelResult = await asc.cancelReview(reviewStatus.versionId);
-
-          if (cancelResult.success) {
-            log(`Successfully cancelled review for build #${reviewStatus.buildNumber}`);
-
-            // Try to find and comment on the cancelled build's PR
-            try {
-              const cancelledCommitInfo = await asc.getBuildCommitSHA(reviewStatus.buildNumber);
-              if (cancelledCommitInfo.found && cancelledCommitInfo.commitSha) {
-                const cancelledPrNumber = github.findPRFromCommit(cancelledCommitInfo.commitSha);
-                if (cancelledPrNumber && cancelledPrNumber !== prNumber) {
-                  const cancelComment = `Build #${reviewStatus.buildNumber} has been withdrawn from App Store review.\n\nA newer build #${latestBuild.buildNumber} from PR #${prNumber} has been submitted instead.`;
-                  if (github.addPRComment(cancelledPrNumber, cancelComment)) {
-                    log(`Added cancellation notice to PR #${cancelledPrNumber}`);
-                  }
-                }
-              }
-            } catch (e) {
-              log(`Warning: Could not notify cancelled build's PR: ${e.message}`);
-            }
-          } else {
-            log(`Failed to cancel review: ${cancelResult.error}`);
-            return;
-          }
-        }
-      }
-    } else {
-      // No PR found
-      if (reviewStatus.inReview) {
-        log(`Build #${latestBuild.buildNumber} is not from a merged PR, skipping (build #${reviewStatus.buildNumber} already in review)`);
-        return;
-      }
-      log('No PR found for commit, using default release notes');
-    }
-
-    // Step 8: Submit build for review
-    if (DRY_RUN) {
-      log(`[DRY RUN] Would submit build #${latestBuild.buildNumber} for review`);
-      log(`[DRY RUN] Release notes: ${releaseNotes}`);
-    } else {
-      log(`Submitting build #${latestBuild.buildNumber} for review...`);
-
-      // Get the build details
-      const buildDetails = await asc.getBuildByNumber(latestBuild.buildNumber);
-      if (!buildDetails) {
-        log(`ERROR: Build #${latestBuild.buildNumber} not found`);
-        return;
-      }
-
-      // Get or create the version
-      const versionInfo = await asc.getOrCreateAppStoreVersion(buildDetails.version);
-      log(`Version ${buildDetails.version}: ${versionInfo.exists ? 'exists' : 'created'} (state: ${versionInfo.state})`);
-
-      // Check if we can submit
-      const submittableStates = ['PREPARE_FOR_SUBMISSION', 'DEVELOPER_REJECTED', 'REJECTED'];
-      if (!submittableStates.includes(versionInfo.state)) {
-        if (versionInfo.state === 'WAITING_FOR_REVIEW' || versionInfo.state === 'IN_REVIEW') {
-          log(`Version ${buildDetails.version} is already in ${versionInfo.state} state`);
-          return;
-        }
-        log(`ERROR: Cannot submit version in state: ${versionInfo.state}`);
-        return;
-      }
-
-      // Select the build
-      log(`Selecting build ${latestBuild.buildNumber}...`);
-      await asc.selectBuildForVersion(versionInfo.versionId, buildDetails.buildId);
-
-      // Update release notes
-      log('Updating release notes...');
-      await asc.updateReleaseNotes(versionInfo.versionId, releaseNotes);
-
-      // Submit for review
-      log('Submitting for review...');
-      await asc.submitForReview(versionInfo.versionId);
-
-      log(`Successfully submitted build #${latestBuild.buildNumber} for App Store review!`);
-      log(`Release notes: ${releaseNotes}`);
-
-      // Add comment to PR
-      if (prNumber) {
-        const comment = `Build #${latestBuild.buildNumber} has been submitted to App Store for review.\n\n**Release Notes:**\n${releaseNotes}`;
-        if (github.addPRComment(prNumber, comment)) {
-          log(`Added comment to PR #${prNumber}`);
-        }
+    // Run release sync
+    if (mode === 'sync' || mode === 'all') {
+      if (git) {
+        await runReleaseSync(asc, git, github, DRY_RUN);
       }
     }
 
-    log('iOS deployment check complete');
+    log('=== Done ===');
 
   } catch (error) {
     log(`ERROR: ${error.message}`);
