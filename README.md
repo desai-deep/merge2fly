@@ -1,4 +1,4 @@
-# merge2fly
+# merge4appstore
 
 Automated iOS App Store deployment and release sync. Monitors TestFlight builds from Xcode Cloud, submits them for App Store review, and tags releases when they go live.
 
@@ -20,7 +20,7 @@ Automated iOS App Store deployment and release sync. Monitors TestFlight builds 
 ```
 Xcode Cloud                          Your VPS
 ┌─────────────────┐                  ┌─────────────────────────┐
-│ Build Workflow  │                  │  merge2fly (cron)       │
+│ Build Workflow  │                  │  merge4appstore (cron)  │
 │ "Publish to     │──► TestFlight ──►│                         │
 │  App Store"     │                  │  1. Check new builds    │
 └─────────────────┘                  │  2. Find merged PR      │
@@ -36,8 +36,8 @@ Xcode Cloud                          Your VPS
 ### 1. Install
 
 ```bash
-git clone https://github.com/desai-deep/merge2fly.git
-cd merge2fly
+git clone https://github.com/desai-deep/merge4appstore.git
+cd merge4appstore
 npm install
 ```
 
@@ -82,7 +82,7 @@ npm run sync:dry       # Dry run sync
 
 ```bash
 # Run every 5 minutes
-*/5 * * * * cd /path/to/merge2fly && node index.js >> logs/cron.log 2>&1
+*/5 * * * * cd /path/to/merge4appstore && node index.js >> logs/cron.log 2>&1
 ```
 
 ## Environment Variables

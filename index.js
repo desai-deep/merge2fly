@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 /**
- * merge2fly - iOS App Store Deployment & Release Sync
+ * merge4appstore - iOS App Store Deployment & Release Sync
  *
  * Combined script that:
  * 1. Monitors TestFlight builds on Xcode Cloud and submits them to App Store review (deploy)
@@ -67,7 +67,7 @@ async function main() {
   process.on('SIGINT', () => { releaseLock(); process.exit(0); });
   process.on('SIGTERM', () => { releaseLock(); process.exit(0); });
 
-  log('=== merge2fly ===');
+  log('=== merge4appstore ===');
   log(`Mode: ${mode}`);
   if (DRY_RUN) {
     log('DRY RUN MODE - No actual changes will be made');
